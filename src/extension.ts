@@ -2,180 +2,333 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 
+const TRACKING_KEY = 'pathHeader.managedHeaders';
+
+type HeaderRecords = Record<string, string>;
+
 function getConfig() {
     return vscode.workspace.getConfiguration('pathHeader');
 }
 
+function getFileKey(uri: vscode.Uri): string {
+    return uri.toString();
+}
+
+async function getRecords(
+    context: vscode.ExtensionContext
+): Promise<HeaderRecords> {
+    return context.workspaceState.get<HeaderRecords>(TRACKING_KEY, {});
+}
+
+async function trackHeader(
+    context: vscode.ExtensionContext,
+    uri: vscode.Uri,
+    header: string
+): Promise<void> {
+    const records = await getRecords(context);
+    records[getFileKey(uri)] = header;
+    await context.workspaceState.update(TRACKING_KEY, records);
+}
+
+async function forgetHeader(
+    context: vscode.ExtensionContext,
+    uri: vscode.Uri
+): Promise<void> {
+    const records = await getRecords(context);
+    delete records[getFileKey(uri)];
+    await context.workspaceState.update(TRACKING_KEY, records);
+}
+
 function getRelativePath(uri: vscode.Uri): string {
-    const config = getConfig();
-    const pathStyle = config.get<string>('pathStyle', 'relative');
+    const style = getConfig().get<string>('pathStyle', 'relative');
 
     const filePath =
-        pathStyle === 'absolute'
+        style === 'absolute'
             ? uri.fsPath
             : vscode.workspace.asRelativePath(uri, false);
 
     return filePath.replace(/\\/g, '/');
 }
 
-function getHeader(uri: vscode.Uri): string | undefined {
-    const filePath = getRelativePath(uri);
-    const extension = path.extname(uri.fsPath).toLowerCase();
-    const prefix = getConfig().get<string>('prefix', '');
+function isStrictJson(uri: vscode.Uri): boolean {
+    return path.extname(uri.fsPath).toLowerCase() === '.json';
+}
 
-    // Strict JSON files cannot contain comments.
-    if (extension === '.json') {
-        return undefined;
+function getLanguageRule(document: vscode.TextDocument): boolean {
+    if (isStrictJson(document.uri)) {
+        return false;
     }
 
-    if (['.html', '.xml', '.svg', '.vue'].includes(extension)) {
-        return `<!-- ${prefix}${filePath} -->`;
-    }
+    const rules = getConfig().get<Record<string, boolean>>(
+        'languageRules',
+        {}
+    );
 
     if (
-        ['.py', '.sh', '.rb', '.yaml', '.yml'].includes(extension)
+        Object.prototype.hasOwnProperty.call(
+            rules,
+            document.languageId
+        )
     ) {
-        return `# ${prefix}${filePath}`;
+        return rules[document.languageId];
+    }
+
+    return true;
+}
+
+function getCommentStyle(uri: vscode.Uri) {
+    const extension = path.extname(uri.fsPath).toLowerCase();
+
+    if (['.html', '.xml', '.svg', '.vue'].includes(extension)) {
+        return { open: '<!-- ', close: ' -->' };
+    }
+
+    if (['.py', '.sh', '.rb', '.yaml', '.yml'].includes(extension)) {
+        return { open: '# ', close: '' };
     }
 
     if (['.css', '.scss', '.less'].includes(extension)) {
-        return `/* ${prefix}${filePath} */`;
+        return { open: '/* ', close: ' */' };
     }
 
-    return `// ${prefix}${filePath}`;
+    return { open: '// ', close: '' };
 }
 
-function getHeaderPath(line: string): string | undefined {
-    const text = line.trim();
-    let content: string | undefined;
-
-    if (text.startsWith('// ')) {
-        content = text.slice(3).trim();
-    } else if (text.startsWith('# ')) {
-        content = text.slice(2).trim();
-    } else if (text.startsWith('/* ') && text.endsWith(' */')) {
-        content = text.slice(3, -3).trim();
-    } else if (text.startsWith('<!-- ') && text.endsWith(' -->')) {
-        content = text.slice(5, -4).trim();
-    }
-
-    if (content === undefined) {
+function createHeader(uri: vscode.Uri): string | undefined {
+    if (isStrictJson(uri)) {
         return undefined;
     }
 
+    const style = getCommentStyle(uri);
     const prefix = getConfig().get<string>('prefix', '');
+    const filePath = getRelativePath(uri);
 
-    if (prefix && content.startsWith(prefix)) {
-        content = content.slice(prefix.length);
-    }
-
-    return content;
+    return `${style.open}${prefix}${filePath}${style.close}`;
 }
 
-function normalizePath(filePath: string): string {
-    return filePath.replace(/\\/g, '/');
+async function isTrackedHeader(
+    context: vscode.ExtensionContext,
+    uri: vscode.Uri,
+    line: string
+): Promise<boolean> {
+    const records = await getRecords(context);
+    return records[getFileKey(uri)] === line.trim();
 }
 
 async function insertHeader(
+    context: vscode.ExtensionContext,
     document: vscode.TextDocument
 ): Promise<void> {
-    const header = getHeader(document.uri);
-
-    if (!header || document.lineCount === 0) {
+    if (!getLanguageRule(document) || document.lineCount === 0) {
         return;
     }
 
-    const existingPath = getHeaderPath(document.lineAt(0).text);
+    const header = createHeader(document.uri);
 
-    if (existingPath !== undefined) {
+    if (!header) {
+        return;
+    }
+
+    const firstLine = document.lineAt(0).text;
+
+    // Never overwrite an existing first line.
+    if (firstLine.trim().length > 0) {
         return;
     }
 
     const edit = new vscode.WorkspaceEdit();
+    edit.insert(document.uri, new vscode.Position(0, 0), `${header}\n`);
 
-    edit.insert(
-        document.uri,
-        new vscode.Position(0, 0),
-        `${header}\n`
-    );
-
-    await vscode.workspace.applyEdit(edit);
+    if (await vscode.workspace.applyEdit(edit)) {
+        await trackHeader(context, document.uri, header);
+    }
 }
 
 async function updateExistingHeader(
+    context: vscode.ExtensionContext,
     document: vscode.TextDocument
 ): Promise<void> {
     if (document.lineCount === 0) {
         return;
     }
 
-    const firstLine = document.lineAt(0);
-    const existingPath = getHeaderPath(firstLine.text);
-    const expectedHeader = getHeader(document.uri);
+    const firstLine = document.lineAt(0).text;
+    const tracked = await isTrackedHeader(
+        context,
+        document.uri,
+        firstLine
+    );
 
-    if (existingPath === undefined || !expectedHeader) {
+    if (!tracked) {
         return;
     }
 
-    const newPath = getRelativePath(document.uri);
+    const newHeader = createHeader(document.uri);
 
-    if (normalizePath(existingPath) === normalizePath(newPath)) {
+    if (!newHeader || firstLine.trim() === newHeader) {
         return;
     }
 
     const edit = new vscode.WorkspaceEdit();
+    edit.replace(document.uri, document.lineAt(0).range, newHeader);
 
-    edit.replace(
-        document.uri,
-        firstLine.range,
-        expectedHeader
+    if (await vscode.workspace.applyEdit(edit)) {
+        await trackHeader(context, document.uri, newHeader);
+    }
+}
+
+async function adoptSaveAsHeader(
+    context: vscode.ExtensionContext,
+    document: vscode.TextDocument
+): Promise<boolean> {
+    if (document.lineCount === 0) {
+        return false;
+    }
+
+    const firstLine = document.lineAt(0).text.trim();
+    const records = await getRecords(context);
+
+    // If this exact generated header belongs to another tracked file,
+    // treat it as a potential Save As copy.
+    const oldKey = Object.keys(records).find(
+        key => key !== getFileKey(document.uri) &&
+            records[key] === firstLine
     );
 
-    await vscode.workspace.applyEdit(edit);
+    if (!oldKey) {
+        return false;
+    }
+
+    const newHeader = createHeader(document.uri);
+
+    if (!newHeader) {
+        return false;
+    }
+
+    await trackHeader(context, document.uri, firstLine);
+
+    if (newHeader !== firstLine) {
+        await updateExistingHeader(context, document);
+    }
+
+    return true;
 }
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('Path Header is active!');
 
-    // Manually add or update a header.
-    const addHeaderCommand = vscode.commands.registerCommand(
-        'path-header.addFilePath',
-        async () => {
-            const editor = vscode.window.activeTextEditor;
-
-            if (!editor) {
-                vscode.window.showWarningMessage(
-                    'No file is currently open.'
-                );
-                return;
-            }
-
-            const document = editor.document;
-
-            if (path.extname(document.fileName).toLowerCase() === '.json') {
-                vscode.window.showWarningMessage(
-                    'Strict JSON does not support comments. Use JSONC instead.'
-                );
-                return;
-            }
-
-            const existingPath = document.lineCount > 0
-                ? getHeaderPath(document.lineAt(0).text)
-                : undefined;
-
-            if (existingPath !== undefined) {
-                await updateExistingHeader(document);
-            } else {
-                await insertHeader(document);
-            }
-        }
+    const statusBarItem = vscode.window.createStatusBarItem(
+        vscode.StatusBarAlignment.Right,
+        100
     );
 
-    context.subscriptions.push(addHeaderCommand);
+    statusBarItem.command = 'path-header.toggleAutoInsert';
+    context.subscriptions.push(statusBarItem);
 
-    // Automatically add headers to newly created files if enabled.
-    const createFilesListener = vscode.workspace.onDidCreateFiles(
-        async event => {
+    function updateStatusBar() {
+        const enabled = getConfig().get<boolean>('autoInsert', true);
+
+        statusBarItem.text = enabled ? '$(file-code)' : '$(circle-slash)';
+
+        statusBarItem.tooltip = enabled
+            ? 'Path Header: Automatic insertion enabled (click to disable)'
+            : 'Path Header: Automatic insertion disabled (click to enable)';
+
+        statusBarItem.accessibilityInformation = {
+            label: enabled
+                ? 'Path Header: Automatic insertion enabled'
+                : 'Path Header: Automatic insertion disabled',
+            role: 'button'
+        };
+
+        statusBarItem.show();
+    }
+
+    updateStatusBar();
+
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration(event => {
+            if (event.affectsConfiguration('pathHeader')) {
+                updateStatusBar();
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand(
+            'path-header.toggleAutoInsert',
+            async () => {
+                const config = getConfig();
+                const enabled = config.get<boolean>('autoInsert', true);
+
+                await config.update(
+                    'autoInsert',
+                    !enabled,
+                    vscode.ConfigurationTarget.Global
+                );
+
+                updateStatusBar();
+
+                vscode.window.showInformationMessage(
+                    `Path Header automatic insertion ${
+                        !enabled ? 'enabled' : 'disabled'
+                    }.`
+                );
+            }
+        )
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand(
+            'path-header.addFilePath',
+            async () => {
+                const editor = vscode.window.activeTextEditor;
+
+                if (!editor) {
+                    vscode.window.showWarningMessage(
+                        'No file is currently open.'
+                    );
+                    return;
+                }
+
+                const document = editor.document;
+
+                if (!getLanguageRule(document)) {
+                    vscode.window.showInformationMessage(
+                        `Path Header is disabled for ${document.languageId} files.`
+                    );
+                    return;
+                }
+
+                if (document.lineCount > 0) {
+                    const firstLine = document.lineAt(0).text;
+
+                    if (
+                        await isTrackedHeader(
+                            context,
+                            document.uri,
+                            firstLine
+                        )
+                    ) {
+                        await updateExistingHeader(context, document);
+                        return;
+                    }
+
+                    if (firstLine.trim().length > 0) {
+                        vscode.window.showInformationMessage(
+                            'The first line is not a tracked Path Header. No changes were made.'
+                        );
+                        return;
+                    }
+                }
+
+                await insertHeader(context, document);
+            }
+        )
+    );
+
+    context.subscriptions.push(
+        vscode.workspace.onDidCreateFiles(async event => {
             if (!getConfig().get<boolean>('autoInsert', true)) {
                 return;
             }
@@ -185,7 +338,7 @@ export function activate(context: vscode.ExtensionContext) {
                     const document =
                         await vscode.workspace.openTextDocument(uri);
 
-                    await insertHeader(document);
+                    await insertHeader(context, document);
                 } catch (error) {
                     console.error(
                         `Could not add header to ${uri.fsPath}:`,
@@ -193,36 +346,33 @@ export function activate(context: vscode.ExtensionContext) {
                     );
                 }
             }
-        }
+        })
     );
 
-    context.subscriptions.push(createFilesListener);
-
-    // Update existing headers when files are renamed or moved.
-    const renameFilesListener = vscode.workspace.onDidRenameFiles(
-        async event => {
+    context.subscriptions.push(
+        vscode.workspace.onDidRenameFiles(async event => {
             for (const file of event.files) {
                 try {
-                    const document =
-                        await vscode.workspace.openTextDocument(file.newUri);
+                    const records = await getRecords(context);
+                    const oldKey = getFileKey(file.oldUri);
+                    const newKey = getFileKey(file.newUri);
+                    const oldHeader = records[oldKey];
 
-                    if (document.lineCount === 0) {
+                    if (!oldHeader) {
                         continue;
                     }
 
-                    const existingPath = getHeaderPath(
-                        document.lineAt(0).text
+                    delete records[oldKey];
+                    records[newKey] = oldHeader;
+                    await context.workspaceState.update(
+                        TRACKING_KEY,
+                        records
                     );
 
-                    if (
-                        existingPath !== undefined &&
-                        normalizePath(existingPath) ===
-                            normalizePath(
-                                getRelativePath(file.oldUri)
-                            )
-                    ) {
-                        await updateExistingHeader(document);
-                    }
+                    const document =
+                        await vscode.workspace.openTextDocument(file.newUri);
+
+                    await updateExistingHeader(context, document);
                 } catch (error) {
                     console.error(
                         `Could not update header for ${file.newUri.fsPath}:`,
@@ -230,23 +380,30 @@ export function activate(context: vscode.ExtensionContext) {
                     );
                 }
             }
-        }
+        })
     );
 
-    context.subscriptions.push(renameFilesListener);
-
-    // Update existing headers when a file is saved under a new path.
-    const saveListener = vscode.workspace.onDidSaveTextDocument(
-        async document => {
+    context.subscriptions.push(
+        vscode.workspace.onDidSaveTextDocument(async document => {
             try {
-                await updateExistingHeader(document);
+                const tracked = await isTrackedHeader(
+                    context,
+                    document.uri,
+                    document.lineCount > 0
+                        ? document.lineAt(0).text
+                        : ''
+                );
+
+                if (tracked) {
+                    await updateExistingHeader(context, document);
+                } else {
+                    await adoptSaveAsHeader(context, document);
+                }
             } catch (error) {
                 console.error('Could not update saved file header:', error);
             }
-        }
+        })
     );
-
-    context.subscriptions.push(saveListener);
 }
 
 export function deactivate() {}

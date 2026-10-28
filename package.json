@@ -2,7 +2,8 @@
   "name": "path-header",
   "displayName": "Path Header",
   "description": "comments the file path at the very top of the file",
-  "version": "0.0.1",
+  "version": "0.1.0",
+  "publisher": "Rose Waters",
   "icon": "images/icon.png",
   "engines": {
     "vscode": "^1.140.0"
@@ -10,13 +11,19 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "path-header.addFilePath",
         "title": "Path Header: Add File Path"
+      },
+      {
+        "command": "path-header.toggleAutoInsert",
+        "title": "Path Header: Toggle Automatic Insertion"
       }
     ],
     "configuration": {
@@ -44,6 +51,14 @@
           "type": "string",
           "default": "",
           "description": "Text inserted before the file path inside the comment, for example 'File: '."
+        },
+        "pathHeader.languageRules": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "description": "Override header behavior for individual VS Code language IDs. Set a language to false to disable headers or true to enable them. Example: {\"typescript\": true, \"markdown\": false}."
         }
       }
     }
