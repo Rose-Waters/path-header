@@ -3,8 +3,12 @@
   "displayName": "Path Header",
   "description": "comments the file path at the very top of the file",
   "version": "0.1.0",
-  "publisher": "Rose Waters",
+  "publisher": "RoseWaters",
   "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rose-Waters/path-header.git"
+  },
   "engines": {
     "vscode": "^1.140.0"
   },
